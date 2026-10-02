@@ -21,7 +21,7 @@ VIN ──[R1 10k]──┬──[R2 10k]── GND
 | R2 | GND |
 
 <!-- Replace with your photo -->
-![Wiring](/check-heeth-esp32/esp-image.jpeg)
+![Wiring](esp-image.jpeg)
 
 ## Config
 
