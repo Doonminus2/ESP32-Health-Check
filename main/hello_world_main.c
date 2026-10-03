@@ -1,245 +1,196 @@
 /*
- * ESP32 Health Check + VIN Monitor (ESP-IDF v5.1+)
- * ------------------------------------------------
- * 1) ตรวจชิป: รุ่น, revision, flash, MAC, heap, สาเหตุการ reset
- * 2) ทดสอบ Wi-Fi: สแกนหา AP รอบตัว (ถ้าเจอ = ภาค RF ยังดี)
- * 3) วัด VIN ผ่าน ADC1 + วงจรแบ่งแรงดัน (ห้ามต่อ VIN เข้าขา GPIO ตรงๆ!)
+ * ESP32 GPIO Probe (ESP-IDF v6)
  *
- * การต่อวงจร (ค่าเริ่มต้น 20k / 10k -> 5V เหลือ ~1.67V ที่ขา GPIO):
+ * ใช้วงจรแบ่งแรงดันชุดเดิมเป็น "หัววัด":
  *
- *   VIN(5V) ---[ R_TOP 20k ]---+---[ R_BOTTOM 10k ]--- GND
- *                              |
- *                         VIN_SENSE_GPIO
+ *   หัววัด ── 10kΩ ──┬── 10kΩ ── GND
+ *                    │
+ *                 GPIO34
  *
- *   ถ้ามีแค่ 10k ให้เอา 10k สองตัวต่ออนุกรมเป็น R_TOP (=20k)
+ * วิธีใช้: เอาปลายสาย "หัววัด" ไปจิ้ม/เสียบที่ขาที่อยากทดสอบ
+ *   - ขา S ของ GPIO ไหนก็ได้ -> บอกว่าเป็น GPIO เบอร์อะไร + แรงดันตอน HIGH/LOW
+ *   - ขา V / 3V3 / VIN       -> บอกว่าเป็นขาไฟ 3.3V หรือ 5V
+ *   - GND หรือไม่ได้เสียบ    -> บอกว่าไม่มีไฟ
+ *
+ * หลักการ: ESP32 จะสั่งขา GPIO ให้เป็น HIGH ทีละขา แล้วดูว่า GPIO34 เห็นไฟตอนไหน
+ * ข้อควรระวัง: ถอดสายสัญญาณของโมดูลอื่นออกก่อนทดสอบ เพราะโค้ดจะสั่งขาเป็น HIGH ชั่วขณะ
  */
 
 #include <stdio.h>
-#include <string.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "sdkconfig.h"
-#include "esp_idf_version.h"
-#include "esp_system.h"
-#include "esp_chip_info.h"
-#include "esp_flash.h"
-#include "esp_mac.h"
-#include "esp_log.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
+#include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "esp_rom_sys.h"
 
-static const char *TAG = "HEALTH";
+#define PROBE_CH   ADC_CHANNEL_6          /* GPIO34 */
+#define R_TOP      10000.0f
+#define R_BOTTOM   10000.0f
+#define DIVIDER    ((R_TOP + R_BOTTOM) / R_BOTTOM)
+#define SAMPLES    16
 
-/* ================== ตั้งค่าตรงนี้ ================== */
-// ต้องเป็นขาของ ADC1 เท่านั้น (ADC2 ใช้ร่วมกับ Wi-Fi ไม่ได้)
-//   ESP32 (classic): GPIO 32-39   | ESP32-S3: GPIO 1-10 | ESP32-C3: GPIO 0-4
-#define VIN_SENSE_GPIO   34
-#define R_TOP_OHM        10000.0f
-#define R_BOTTOM_OHM     10000.0f  // GPIO -> GND
-#define ADC_SAMPLES      64         // เฉลี่ยกี่ครั้งต่อการอ่าน 1 รอบ
-/* =================================================== */
+/* ขาที่สั่ง output ได้ และไม่ใช่ขา flash (6-11), UART (1,3), ปุ่ม BOOT (0)
+ * ขา 34-39 เป็น input อย่างเดียว ทดสอบด้วยวิธีนี้ไม่ได้ */
+static const int TEST_PINS[] = {
+    2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19,
+    21, 22, 23, 25, 26, 27, 32, 33
+};
+#define N_PINS (sizeof(TEST_PINS) / sizeof(TEST_PINS[0]))
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
-#define VIN_ADC_ATTEN ADC_ATTEN_DB_12
-#else
-#define VIN_ADC_ATTEN ADC_ATTEN_DB_11
-#endif
+typedef struct {
+    int   pin;      /* เบอร์ GPIO ที่เจอ, -1 = ไม่ใช่ GPIO ที่ทดสอบ */
+    float v_idle;   /* แรงดันก่อนสั่งขาใดๆ */
+    float v_high;   /* แรงดันตอนสั่งขานั้นเป็น HIGH */
+    float v_low;    /* แรงดันตอนสั่งขานั้นเป็น LOW */
+} probe_result_t;
 
-static adc_oneshot_unit_handle_t s_adc;
-static adc_channel_t s_chan;
-static adc_cali_handle_t s_cali;
-static bool s_cali_ok = false;
+static adc_oneshot_unit_handle_t adc;
+static adc_cali_handle_t cali;
 
-/* ---------- 1) ตรวจชิป ---------- */
-static const char *reset_reason_str(esp_reset_reason_t r)
+static void adc_setup(void)
 {
-    switch (r) {
-    case ESP_RST_POWERON:   return "Power-on (ปกติ)";
-    case ESP_RST_EXT:       return "External pin";
-    case ESP_RST_SW:        return "Software restart";
-    case ESP_RST_PANIC:     return "PANIC - โปรแกรมก่อนหน้า crash!";
-    case ESP_RST_INT_WDT:   return "Interrupt watchdog";
-    case ESP_RST_TASK_WDT:  return "Task watchdog";
-    case ESP_RST_WDT:       return "Other watchdog";
-    case ESP_RST_DEEPSLEEP: return "Wake from deep sleep";
-    case ESP_RST_BROWNOUT:  return "BROWNOUT - ไฟเลี้ยงตก!";
-    case ESP_RST_SDIO:      return "SDIO";
-    default:                return "Unknown";
-    }
+    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc));
+
+    adc_oneshot_chan_cfg_t ch_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc, PROBE_CH, &ch_cfg));
+
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .default_vref = 1100,
+    };
+    ESP_ERROR_CHECK(adc_cali_create_scheme_line_fitting(&cali_cfg, &cali));
 }
 
-static void check_chip(void)
+/* ตั้งทุกขาเป็น input แบบไม่มี pull-up/down เพื่อไม่ให้รบกวนการวัด */
+static void pins_init(void)
 {
-    esp_chip_info_t info;
-    esp_chip_info(&info);
-
-    uint32_t flash_size = 0;
-    esp_err_t ferr = esp_flash_get_size(NULL, &flash_size);
-
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-
-    printf("\n========== ESP32 HEALTH CHECK ==========\n");
-    printf("Target       : %s\n", CONFIG_IDF_TARGET);
-    printf("CPU cores    : %d\n", info.cores);
-    printf("Revision     : v%d.%d\n", info.revision / 100, info.revision % 100);
-    printf("Features     : %s%s%s%s\n",
-           (info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi " : "",
-           (info.features & CHIP_FEATURE_BT)       ? "BT "   : "",
-           (info.features & CHIP_FEATURE_BLE)      ? "BLE "  : "",
-           (info.features & CHIP_FEATURE_EMB_FLASH) ? "EmbFlash " : "");
-    if (ferr == ESP_OK) {
-        printf("Flash size   : %lu MB\n", (unsigned long)(flash_size / (1024 * 1024)));
-    } else {
-        printf("Flash size   : อ่านไม่ได้ (%s) <-- ผิดปกติ\n", esp_err_to_name(ferr));
+    uint64_t mask = 0;
+    for (int i = 0; i < N_PINS; i++) {
+        mask |= 1ULL << TEST_PINS[i];
     }
-    printf("MAC (STA)    : %02X:%02X:%02X:%02X:%02X:%02X\n",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    printf("Free heap    : %lu bytes\n", (unsigned long)esp_get_free_heap_size());
-    printf("Reset reason : %s\n", reset_reason_str(esp_reset_reason()));
-    printf("IDF version  : %s\n", esp_get_idf_version());
-    printf("=========================================\n\n");
+    gpio_config_t cfg = {
+        .pin_bit_mask = mask,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
 }
 
-/* ---------- 2) ทดสอบ Wi-Fi ---------- */
-static void wifi_scan_test(void)
+/* อ่านแรงดันที่หัววัด (คูณกลับวงจรแบ่งแรงดันแล้ว) หน่วย V */
+static float read_volts(void)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+    int sum = 0;
+    for (int i = 0; i < SAMPLES; i++) {
+        int mv = 0;
+        adc_oneshot_get_calibrated_result(adc, cali, PROBE_CH, &mv);
+        sum += mv;
     }
-    ESP_ERROR_CHECK(err);
+    return (sum / (float)SAMPLES) * DIVIDER / 1000.0f;
+}
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+static probe_result_t scan(void)
+{
+    probe_result_t r = { .pin = -1 };
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Scanning Wi-Fi...");
-    err = esp_wifi_scan_start(NULL, true);   // blocking scan
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi scan FAIL: %s", esp_err_to_name(err));
-        return;
+    r.v_idle = read_volts();
+    if (r.v_idle > 0.3f) {
+        return r;  /* มีไฟจากที่อื่นอยู่แล้ว (ขาไฟ หรือโมดูลขับอยู่) ไม่ต้องสลับขา */
     }
 
-    uint16_t total = 0;
-    esp_wifi_scan_get_ap_num(&total);
+    for (int i = 0; i < N_PINS; i++) {
+        int p = TEST_PINS[i];
 
-    wifi_ap_record_t recs[10];
-    uint16_t n = 10;
-    esp_wifi_scan_get_ap_records(&n, recs);
+        gpio_set_level(p, 1);
+        gpio_set_direction(p, GPIO_MODE_OUTPUT);
+        esp_rom_delay_us(100);
+        float vh = read_volts();
 
-    if (total == 0) {
-        ESP_LOGW(TAG, "Wi-Fi: ไม่พบ AP เลย (ถ้ารอบตัวมี Wi-Fi อยู่ แสดงว่าภาค RF/เสาอาจมีปัญหา)");
-    } else {
-        ESP_LOGI(TAG, "Wi-Fi OK: พบ %u AP", total);
-        for (int i = 0; i < n; i++) {
-            printf("  %2d) %-32s RSSI %d dBm\n", i + 1, (char *)recs[i].ssid, recs[i].rssi);
+        gpio_set_level(p, 0);
+        esp_rom_delay_us(100);
+        float vl = read_volts();
+
+        gpio_set_direction(p, GPIO_MODE_INPUT);
+
+        if (vh > 1.5f) {
+            r.pin = p;
+            r.v_high = vh;
+            r.v_low = vl;
+            break;
         }
     }
-    esp_wifi_stop();
-    printf("\n");
+    return r;
 }
 
-/* ---------- 3) วัด VIN ---------- */
-static void vin_adc_init(void)
+/* แปลงผลเป็นรหัส เพื่อ print เฉพาะตอนที่เปลี่ยนจุดเสียบ */
+static int result_key(const probe_result_t *r)
 {
-    adc_unit_t unit;
-    ESP_ERROR_CHECK(adc_oneshot_io_to_channel(VIN_SENSE_GPIO, &unit, &s_chan));
-    if (unit != ADC_UNIT_1) {
-        ESP_LOGE(TAG, "GPIO%d ไม่ใช่ ADC1 - เปลี่ยน VIN_SENSE_GPIO", VIN_SENSE_GPIO);
-        abort();
-    }
+    if (r->pin >= 0)                          return r->pin;
+    if (r->v_idle > 4.3f)                     return 105;  /* 5V */
+    if (r->v_idle > 2.9f && r->v_idle < 3.6f) return 103;  /* 3.3V */
+    if (r->v_idle > 0.3f)                     return 101;  /* แรงดันอื่นๆ */
+    return 100;                                            /* ไม่มีไฟ */
+}
 
-    adc_oneshot_unit_init_cfg_t ucfg = { .unit_id = ADC_UNIT_1 };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&ucfg, &s_adc));
-
-    adc_oneshot_chan_cfg_t ccfg = {
-        .atten = VIN_ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, s_chan, &ccfg));
-
-    // Calibration (ใช้ค่าที่โรงงานเขียนไว้ใน eFuse)
-    esp_err_t err = ESP_FAIL;
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    adc_cali_curve_fitting_config_t cal = {
-        .unit_id = ADC_UNIT_1,
-        .chan = s_chan,
-        .atten = VIN_ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    err = adc_cali_create_scheme_curve_fitting(&cal, &s_cali);
-#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    adc_cali_line_fitting_config_t cal = {
-        .unit_id = ADC_UNIT_1,
-        .atten = VIN_ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    err = adc_cali_create_scheme_line_fitting(&cal, &s_cali);
-#endif
-    s_cali_ok = (err == ESP_OK);
-    if (s_cali_ok) {
-        ESP_LOGI(TAG, "ADC calibration: OK");
+static void print_result(const probe_result_t *r)
+{
+    if (r->pin >= 0) {
+        bool ok = (r->v_high >= 3.0f) && (r->v_low <= 0.3f);
+        printf("[GPIO %2d]  HIGH = %.2f V   LOW = %.2f V   -> %s\n",
+               r->pin, r->v_high, r->v_low,
+               ok ? "ปกติ" : "ผิดปกติ (ขาอาจเสีย หรือมีอะไรต่อพ่วงอยู่)");
+    } else if (r->v_idle > 4.3f) {
+        printf("[ขาไฟ 5V]   %.2f V   (ขา V ตอน jumper อยู่ที่ 5V หรือขา VIN)\n", r->v_idle);
+    } else if (r->v_idle > 2.9f && r->v_idle < 3.6f) {
+        printf("[ขาไฟ 3.3V] %.2f V   (ขา V ตอน jumper อยู่ที่ 3V3 หรือขา 3V3)\n", r->v_idle);
+    } else if (r->v_idle > 0.3f) {
+        printf("[มีแรงดัน]  %.2f V   (อาจเป็นขาสัญญาณที่มีโมดูลขับไฟอยู่)\n", r->v_idle);
     } else {
-        ESP_LOGW(TAG, "ADC calibration: ไม่มี - ค่าที่ได้จะเป็นค่าประมาณหยาบๆ");
+        printf("[ไม่มีไฟ]   ยังไม่ได้เสียบ / เสียบที่ GND / หรือเป็นขา GPIO 0,1,3,34-39\n");
     }
-}
-
-static float read_vin_volts(int *pin_mv_out)
-{
-    int64_t sum_mv = 0;
-    for (int i = 0; i < ADC_SAMPLES; i++) {
-        int raw = 0, mv = 0;
-        ESP_ERROR_CHECK(adc_oneshot_read(s_adc, s_chan, &raw));
-        if (s_cali_ok) {
-            adc_cali_raw_to_voltage(s_cali, raw, &mv);
-        } else {
-            mv = raw * 3100 / 4095;   // ประมาณ (12-bit, atten 11/12 dB)
-        }
-        sum_mv += mv;
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
-    int pin_mv = (int)(sum_mv / ADC_SAMPLES);
-    if (pin_mv_out) *pin_mv_out = pin_mv;
-
-    float ratio = (R_TOP_OHM + R_BOTTOM_OHM) / R_BOTTOM_OHM;
-    return (pin_mv / 1000.0f) * ratio;
-}
-
-static const char *judge_vin(float v)
-{
-    if (v < 0.3f)  return "ไม่มีไฟ / ยังไม่ได้ต่อวงจรแบ่งแรงดัน";
-    if (v < 4.4f)  return "ต่ำเกินไป (สาย USB/อะแดปเตอร์จ่ายไม่พอ?)";
-    if (v < 4.75f) return "ค่อนข้างต่ำ แต่ยังใช้ได้ (ปกติถ้าผ่านไดโอดบนบอร์ด)";
-    if (v <= 5.25f) return "ปกติ (~5V)";
-    if (v <= 5.6f) return "สูงกว่าปกติเล็กน้อย";
-    return "สูงเกิน! ตรวจแหล่งจ่าย";
 }
 
 void app_main(void)
 {
-    check_chip();
-    wifi_scan_test();
-    vin_adc_init();
+    adc_setup();
+    pins_init();
 
-    ESP_LOGI(TAG, "เริ่มวัด VIN ที่ GPIO%d (R_TOP=%.0f, R_BOTTOM=%.0f)",
-             VIN_SENSE_GPIO, R_TOP_OHM, R_BOTTOM_OHM);
+    printf("\n========== ESP32 GPIO PROBE ==========\n");
+    printf("เอาสายหัววัดไปเสียบที่ขาที่อยากทดสอบ แล้วดูผลด้านล่าง\n");
+    printf("(จะ print ใหม่ทุกครั้งที่ย้ายจุดเสียบ)\n");
+    printf("======================================\n\n");
+
+    int last_key = -1;
+    int candidate = -1;
+    int stable = 0;
 
     while (1) {
-        int pin_mv = 0;
-        float vin = read_vin_volts(&pin_mv);
-        printf("Pin: %4d mV  ->  VIN: %.2f V   [%s]\n", pin_mv, vin, judge_vin(vin));
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        probe_result_t r = scan();
+        int key = result_key(&r);
+
+        /* ต้องได้ผลเดิม 2 รอบติดกันก่อน กันค่ากระตุกตอนกำลังเสียบสาย */
+        if (key == candidate) {
+            stable++;
+        } else {
+            candidate = key;
+            stable = 1;
+        }
+
+        if (stable == 2 && key != last_key) {
+            print_result(&r);
+            last_key = key;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
